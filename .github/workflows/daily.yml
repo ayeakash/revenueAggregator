@@ -1,4 +1,4 @@
-name: Daily YouTube KPI (no Sheets)
+name: Daily YouTube KPI (robust)
 
 on:
   schedule:
@@ -33,41 +33,81 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Write tokens (robust)
+      - name: Write secret files (robust)
         shell: bash
+        env:
+          # pass secrets into env (empty if not set)
+          TOKENS_B64:            ${{ secrets.YT_TOKENS_JSON_B64 }}
+          TOKENS_RAW:            ${{ secrets.YT_TOKENS_JSON }}
+          SA_B64:                ${{ secrets.SERVICE_ACCOUNT_JSON_B64 }}
+          SA_RAW:                ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          SHEET_URL:             ${{ secrets.GOOGLE_SHEET_URL }}
         run: |
-          set -euo pipefail
-          if [[ -n "${{ secrets.YT_TOKENS_JSON_B64 || '' }}" ]]; then
-            echo "${{ secrets.YT_TOKENS_JSON_B64 }}" | base64 --decode > yt_refresh_tokens.json
-          elif [[ -n "${{ secrets.YT_TOKENS_JSON || '' }}" ]]; then
-            printf '%s' "${{ secrets.YT_TOKENS_JSON }}" > yt_refresh_tokens.json
-          else
-            echo "❌ Provide YT_TOKENS_JSON_B64 (preferred) or YT_TOKENS_JSON"; exit 1
-          fi
-          chmod 600 yt_refresh_tokens.json
+          set -Eeuo pipefail
 
-          # Validate JSON fast
+          write_secret_file() {
+            local name="$1" b64="$2" raw="$3" out="$4"
+            if [[ -n "${b64:-}" ]]; then
+              echo "::notice::Decoding $name (base64) -> $out"
+              printf '%s' "$b64" | base64 --decode > "$out"
+              return 0
+            elif [[ -n "${raw:-}" ]]; then
+              echo "::notice::Writing $name (raw) -> $out"
+              printf '%s' "$raw" > "$out"
+              return 0
+            else
+              echo "::notice::$name not provided; will not create $out"
+              return 1
+            fi
+          }
+
+          # Tokens (required)
+          write_secret_file "YT_TOKENS_JSON" "${TOKENS_B64:-}" "${TOKENS_RAW:-}" yt_refresh_tokens.json \
+            || { echo "❌ Missing YT_TOKENS_JSON_B64 (preferred) or YT_TOKENS_JSON"; exit 1; }
+
+          # Service account (optional; required only if using Sheets)
+          SA_WRITTEN=0
+          if write_secret_file "SERVICE_ACCOUNT_JSON" "${SA_B64:-}" "${SA_RAW:-}" service_account.json; then
+            SA_WRITTEN=1
+          fi
+
+          # chmod only if files exist
+          [[ -f yt_refresh_tokens.json ]] && chmod 600 yt_refresh_tokens.json
+          [[ -f service_account.json   ]] && chmod 600 service_account.json
+
+          # Validate tokens JSON right away (clear error if malformed)
           python - <<'PY'
-          import json, pathlib
-          json.loads(pathlib.Path("yt_refresh_tokens.json").read_text(encoding="utf-8"))
+          import json, pathlib, sys
+          p = pathlib.Path("yt_refresh_tokens.json")
+          try:
+              json.loads(p.read_text(encoding="utf-8"))
+          except Exception as e:
+              print("❌ yt_refresh_tokens.json is not valid JSON:", e)
+              print("Tip: use DOUBLE quotes, no code fences; or provide base64 secret.")
+              sys.exit(1)
           print("✅ yt_refresh_tokens.json is valid JSON")
           PY
+
+          # Warn if Sheet URL set but SA missing
+          if [[ -n "${SHEET_URL:-}" && $SA_WRITTEN -ne 1 ]]; then
+            echo "::warning::GOOGLE_SHEET_URL is set, but service_account.json was not provided. Sheets write will fail."
+          fi
 
       - name: Run script
         env:
           # YouTube OAuth
-          YT_CLIENT_ID:     ${{ secrets.YT_CLIENT_ID }}
-          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_CLIENT_ID:       ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET:   ${{ secrets.YT_CLIENT_SECRET }}
 
           # Slack
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
 
-          # Sheets disabled
-          GOOGLE_SHEET_URL: ""
-          SHEETS_AUTH_MODE: "service_account"
-          SERVICE_ACCOUNT_JSON: "service_account.json"
+          # Sheets (optional)
+          GOOGLE_SHEET_URL:   ${{ secrets.GOOGLE_SHEET_URL }}
+          SHEETS_AUTH_MODE:   ${{ secrets.SHEETS_AUTH_MODE || 'service_account' }}
+          SERVICE_ACCOUNT_JSON: service_account.json
 
           # Script config
-          YT_TOKENS_FILE: yt_refresh_tokens.json
-          YT_CURRENCY:    ${{ secrets.YT_CURRENCY || 'USD' }}
+          YT_TOKENS_FILE:     yt_refresh_tokens.json
+          YT_CURRENCY:        ${{ secrets.YT_CURRENCY || 'USD' }}
         run: python main.py
