@@ -1,10 +1,9 @@
-name: Daily YouTube KPI
+name: Daily YouTube KPI (no Sheets)
 
 on:
   schedule:
-    # 02:00 UTC ≈ 07:30 IST
-    - cron: "0 2 * * *"
-  workflow_dispatch: {}    # manual runs
+    - cron: "0 2 * * *"   # 02:00 UTC ≈ 07:30 IST
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -33,48 +32,40 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          
-      - name: Write secret files (from base64)
+
+      - name: Write tokens (robust)
         shell: bash
         run: |
           set -euo pipefail
-          echo "${{ secrets.YT_TOKENS_JSON_B64 }}" | base64 --decode > yt_refresh_tokens.json
-          # If you also base64'd the Sheets key, decode it too:
-          if [ -n "${{ secrets.SERVICE_ACCOUNT_JSON_B64 }}" ]; then
-            echo "${{ secrets.SERVICE_ACCOUNT_JSON_B64 }}" | base64 --decode > service_account.json
+          if [[ -n "${{ secrets.YT_TOKENS_JSON_B64 || '' }}" ]]; then
+            echo "${{ secrets.YT_TOKENS_JSON_B64 }}" | base64 --decode > yt_refresh_tokens.json
+          elif [[ -n "${{ secrets.YT_TOKENS_JSON || '' }}" ]]; then
+            printf '%s' "${{ secrets.YT_TOKENS_JSON }}" > yt_refresh_tokens.json
+          else
+            echo "❌ Provide YT_TOKENS_JSON_B64 (preferred) or YT_TOKENS_JSON"; exit 1
           fi
-          chmod 600 yt_refresh_tokens.json service_account.json
-      
-      - name: Validate tokens file (after write)
-        run: |
+          chmod 600 yt_refresh_tokens.json
+
+          # Validate JSON fast
           python - <<'PY'
           import json, pathlib
-          raw = pathlib.Path("yt_refresh_tokens.json").read_text(encoding="utf-8")
-          json.loads(raw)
+          json.loads(pathlib.Path("yt_refresh_tokens.json").read_text(encoding="utf-8"))
           print("✅ yt_refresh_tokens.json is valid JSON")
           PY
 
-      # - name: Write secret files (secure)
-      #   shell: bash
-      #   run: |
-      #     set -euo pipefail
-      #     printf '%s' "${{ secrets.YT_TOKENS_JSON }}" > yt_refresh_tokens.json
-      #     printf '%s' "${{ secrets.SERVICE_ACCOUNT_JSON }}" > service_account.json
-      #     chmod 600 yt_refresh_tokens.json service_account.json
-
       - name: Run script
         env:
-          # OAuth for YouTube APIs
+          # YouTube OAuth
           YT_CLIENT_ID:     ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
 
           # Slack
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
-          # Sheets (optional)
-          GOOGLE_SHEET_URL:   ${{ secrets.GOOGLE_SHEET_URL }}
-          SHEETS_AUTH_MODE:   ${{ secrets.SHEETS_AUTH_MODE || 'service_account' }}
-          SERVICE_ACCOUNT_JSON: service_account.json
+          # Sheets disabled
+          GOOGLE_SHEET_URL: ""
+          SHEETS_AUTH_MODE: "service_account"
+          SERVICE_ACCOUNT_JSON: "service_account.json"
 
           # Script config
           YT_TOKENS_FILE: yt_refresh_tokens.json
