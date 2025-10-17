@@ -34,25 +34,79 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           
-      - name: Write secret files (from base64)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "${{ secrets.YT_TOKENS_JSON_B64 }}" | base64 --decode > yt_refresh_tokens.json
-          # If you also base64'd the Sheets key, decode it too:
-          if [ -n "${{ secrets.SERVICE_ACCOUNT_JSON_B64 }}" ]; then
-            echo "${{ secrets.SERVICE_ACCOUNT_JSON_B64 }}" | base64 --decode > service_account.json
-          fi
-          chmod 600 yt_refresh_tokens.json service_account.json
-      
-      - name: Validate tokens file (after write)
-        run: |
-          python - <<'PY'
-          import json, pathlib
-          raw = pathlib.Path("yt_refresh_tokens.json").read_text(encoding="utf-8")
-          json.loads(raw)
-          print("✅ yt_refresh_tokens.json is valid JSON")
-          PY
+      # BEFORE: Run script
+- name: Write secret files (robust)
+  shell: bash
+  run: |
+    set -euo pipefail
+
+    # --- Helper: write a secret to file from base64 or raw text ---
+    write_secret_file() {
+      local name="$1"   # env/secret name (for logging)
+      local b64="$2"    # base64 secret value (may be empty)
+      local raw="$3"    # raw secret value (may be empty)
+      local out="$4"    # output file path
+
+      if [[ -n "$b64" ]]; then
+        echo "::notice::Decoding $name (base64) -> $out"
+        echo "$b64" | base64 --decode > "$out"
+        return 0
+      elif [[ -n "$raw" ]]; then
+        echo "::notice::Writing $name (raw) -> $out"
+        # Use printf to preserve exact bytes/newlines
+        printf '%s' "$raw" > "$out"
+        return 0
+      else
+        echo "::notice::$name not provided; will not create $out"
+        return 1
+      fi
+    }
+
+    # --- Write mandatory tokens file ---
+    write_secret_file "YT_TOKENS_JSON" \
+      "${{ secrets.YT_TOKENS_JSON_B64 || '' }}" \
+      "${{ secrets.YT_TOKENS_JSON      || '' }}" \
+      yt_refresh_tokens.json
+
+    # Fail early if tokens file wasn't created
+    if [[ ! -f yt_refresh_tokens.json ]]; then
+      echo "❌ yt_refresh_tokens.json was not created. Provide YT_TOKENS_JSON_B64 (preferred) or YT_TOKENS_JSON."
+      exit 1
+    fi
+
+    # --- Write optional service account file (only if you use Sheets) ---
+    SA_WROTE=0
+    if write_secret_file "SERVICE_ACCOUNT_JSON" \
+         "${{ secrets.SERVICE_ACCOUNT_JSON_B64 || '' }}" \
+         "${{ secrets.SERVICE_ACCOUNT_JSON      || '' }}" \
+         service_account.json; then
+      SA_WROTE=1
+    fi
+
+    # --- Secure permissions only for files that exist ---
+    [[ -f yt_refresh_tokens.json ]] && chmod 600 yt_refresh_tokens.json
+    [[ -f service_account.json   ]] && chmod 600 service_account.json
+
+    # --- Validate tokens JSON now to fail fast with a clear error ---
+    python - <<'PY'
+    import json, pathlib, sys
+    p = pathlib.Path("yt_refresh_tokens.json")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        print("❌ yt_refresh_tokens.json is not valid JSON:", e)
+        print("Tip: paste raw JSON (no backticks/extra quotes) or use base64 secret.")
+        sys.exit(1)
+    print("✅ yt_refresh_tokens.json valid. Channels:", list(data.keys()))
+    PY
+
+    # If you expect Sheets to work, ensure the SA file exists
+    if [[ -n "${{ secrets.GOOGLE_SHEET_URL || '' }}" ]]; then
+      if [[ $SA_WROTE -ne 1 ]]; then
+        echo "::warning::GOOGLE_SHEET_URL is set but service_account.json was not provided. Sheets write will be skipped or fail."
+      fi
+    fi
+
 
       # - name: Write secret files (secure)
       #   shell: bash
