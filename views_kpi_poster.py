@@ -338,10 +338,10 @@ def build_views_sections(labels, per_chan):
         tot_last = None
     y_date = max(y_date_candidates).isoformat() if y_date_candidates else EM_DASH
 
-    header_y = f":spiral_calendar_pad: *Yesterday (Views):* {fmt_or_dash_number(tot_y)}"
-    # Changed: “Projection” -> “[P]”
-    header_proj = f":calendar: *This Month [P] (Views):* {fmt_or_dash_number(tot_proj)}" + \
+    header_y = f":spiral_calendar_pad: *Yesterday:* {fmt_or_dash_number(tot_y)}"
+    header_proj = f":calendar: *This Month [P]:* {fmt_or_dash_number(tot_proj)}" + \
                   (pct_change(tot_proj or 0.0, tot_last or 0.0) if (tot_proj is not None and tot_last) else "")
+
 
     blocks = [
         {"type":"section","text":{"type":"mrkdwn","text":"*Views KPI*"}},
