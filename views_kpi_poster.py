@@ -301,7 +301,8 @@ def build_views_sections(labels, per_chan, global_latest):
 
     header_title = f"*Views KPI* ({fmt_day(global_latest)})" if global_latest else "*Views KPI*"
     header_y     = f":spiral_calendar_pad: *Yesterday:* {fmt_or_dash_number(tot_y)}"
-    header_proj  = f":calendar: *This Month Projection:* {fmt_or_dash_number(tot_proj)}" + \
+    # >>> changed here: "This Month [P]" instead of "This Month Projection"
+    header_proj  = f":calendar: *This Month [P]:* {fmt_or_dash_number(tot_proj)}" + \
                    (pct_change(tot_proj or 0.0, tot_last or 0.0) if (tot_proj is not None and tot_last) else "")
 
     blocks = [
