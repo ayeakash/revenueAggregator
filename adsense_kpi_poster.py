@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-YouTube AdSense KPI Poster — Revenue ONLY (No Sheets, Global Projection, Debug Tail)
+YouTube AdSense KPI Poster — Revenue ONLY
+(No Sheets, Global Projection, Improved Latest-Date Detection, Tail Debug)
 
 - Pulls per-channel revenue from YouTube Analytics.
 - Computes per-channel AND total projections using a single global finalized date.
@@ -18,7 +19,7 @@ Env (required):
 Optional:
   - YT_CURRENCY (USD|INR; default USD)
   - YT_LATEST_PAD_DAYS (default 2)  -> pad end of window when detecting latest day
-  - YT_DEBUG_TAIL=true|false (default false) -> print last 7 API rows per channel
+  - YT_DEBUG_TAIL=true|false (default false) -> print last 7 API rows per channel (revenue)
 """
 
 import os, json, sys, re, pathlib, traceback
@@ -74,7 +75,7 @@ def load_tokens_file(path: str) -> dict:
     if not p.exists():
         raise FileNotFoundError(f"Tokens file not found: {path}")
     raw = p.read_text(encoding="utf-8")
-    # allow //, # comments and trailing commas
+    # allow /* ... */, //..., #... comments, and trailing commas
     raw = re.sub(r"/\*.*?\*/", "", raw, flags=re.S)
     raw = re.sub(r"^\s*//.*?$", "", raw, flags=re.M)
     raw = re.sub(r"^\s*#.*?$",  "", raw, flags=re.M)
@@ -91,7 +92,7 @@ def require_env(name, placeholder_fragments=()):
     return val
 
 def fmt_day(d):
-    # Example: 16-Oct-2025
+    # Example: 19-Oct-2025
     return d.strftime("%d-%b-%Y") if d else ""
 
 # -------------------- OPTIONAL: AUTO-HYDRATE OAUTH CLIENT --------------------
@@ -165,7 +166,7 @@ def channel_identity(access_token: str):
     return ch["id"], ch["snippet"]["title"]
 
 # -------------------- YT ANALYTICS HELPERS --------------------
-def yt_query(access_token, start_date, end_date, dims="day", metrics="estimatedRevenue", currency=CURRENCY):
+def yt_query(access_token, start_date, end_date, dims="day", metrics="estimatedRevenue", currency=os.getenv("YT_CURRENCY","USD")):
     r = requests.get(
         ANALYTICS,
         headers={"Authorization": f"Bearer {access_token}"},
@@ -186,7 +187,7 @@ def yt_query(access_token, start_date, end_date, dims="day", metrics="estimatedR
         raise
     return r.json()
 
-# Latest-day detection with padding to cover PT finalization lag
+# Latest-day detection with padding to cover PT finalize lag & local day boundaries
 def detect_latest_day(access_token, metric: str) -> date:
     """
     Ask YT Analytics for a wide window ending 'today + pad' and pick the latest date
@@ -194,12 +195,11 @@ def detect_latest_day(access_token, metric: str) -> date:
     """
     pad_days = max(0, LATEST_PAD_DAYS)
     end = date.today() + timedelta(days=pad_days)
-    start = end - timedelta(days=45)  # wide enough for month edges + lag
+    start = end - timedelta(days=45)
     try:
         data = yt_query(access_token, start.isoformat(), end.isoformat(),
                         dims="day", metrics=metric)
     except requests.HTTPError:
-        # last-resort wider fallback
         start = end - timedelta(days=75)
         data  = yt_query(access_token, start.isoformat(), end.isoformat(),
                          dims="day", metrics=metric)
@@ -210,7 +210,7 @@ def detect_latest_day(access_token, metric: str) -> date:
     y, m, d = map(int, latest_str.split("-"))
     return date(y, m, d)
 
-def sum_metric(access_token, start, end, metric, currency=CURRENCY) -> float:
+def sum_metric(access_token, start, end, metric, currency=os.getenv("YT_CURRENCY","USD")) -> float:
     data = yt_query(access_token, start, end, dims="day", metrics=metric, currency=currency)
     return float(sum(r[1] for r in (data.get("rows") or [])))
 
@@ -236,14 +236,15 @@ def print_api_tail_for_revenue(per_chan, labels_order):
             if not tail:
                 print(f"  - {label}: (no rows)")
                 continue
-            pretty = ", ".join([f"{d}:{v:.0f}" for d, v in tail])
+            pretty = ", ".join([f"{d}:{int(round(v)):,}" for d, v in tail])
             print(f"  - {label}: {pretty}")
         except Exception as e:
             print(f"  - {label}: error fetching tail: {e}")
 
 # -------------------- SLACK FORMAT & POSTING --------------------
 def fmt_money(x):
-    return f"${x:,.0f}" if CURRENCY.upper() == "USD" else f"{CURRENCY} {x:,.0f}"
+    cur = os.getenv("YT_CURRENCY", "USD").upper()
+    return f"${x:,.0f}" if cur == "USD" else f"{cur} {x:,.0f}"
 
 def fmt_or_dash_money(x):
     return fmt_money(x) if isinstance(x, (int, float)) else EM_DASH
@@ -306,7 +307,8 @@ def build_revenue_sections(labels, per_chan, global_latest):
 
     header_title = f"*AdSense KPI* ({fmt_day(global_latest)})" if global_latest else "*AdSense KPI*"
     header_y     = f":spiral_calendar_pad: *Yesterday:* {fmt_or_dash_money(tot_y)}"
-    header_proj  = f":calendar: *This Month Projection:* {fmt_or_dash_money(tot_proj)}" + \
+    # >>> changed here to "This Month [P]"
+    header_proj  = f":calendar: *This Month [P]:* {fmt_or_dash_money(tot_proj)}" + \
                    (pct_change(tot_proj or 0.0, tot_last or 0.0) if (tot_proj is not None and tot_last) else "")
 
     blocks = [
@@ -383,9 +385,9 @@ def main():
                 prev_month_last = month_first - timedelta(days=1)
                 prev_month_first = prev_month_last.replace(day=1)
 
-                y_rev   = sum_metric(at, rev_latest.isoformat(), rev_latest.isoformat(), "estimatedRevenue")
-                mtd_rev = sum_metric(at, month_first.isoformat(), rev_latest.isoformat(), "estimatedRevenue")
-                last_rev= sum_metric(at, prev_month_first.isoformat(), prev_month_last.isoformat(), "estimatedRevenue")
+                y_rev   = sum_metric(at, rev_latest.isoformat(), rev_latest.isoformat(), "estimatedRevenue", CURRENCY)
+                mtd_rev = sum_metric(at, month_first.isoformat(), rev_latest.isoformat(), "estimatedRevenue", CURRENCY)
+                last_rev= sum_metric(at, prev_month_first.isoformat(), prev_month_last.isoformat(), "estimatedRevenue", CURRENCY)
                 print(f"  Rev latest: {rev_latest}  Y={fmt_or_dash_money(y_rev)}  MTD={fmt_or_dash_money(mtd_rev)}  LastM={fmt_or_dash_money(last_rev)}")
             else:
                 print("  ! No finalized revenue rows.")
@@ -445,7 +447,8 @@ def main():
                     at,
                     month_first_global.isoformat(),
                     global_latest.isoformat(),
-                    "estimatedRevenue"
+                    "estimatedRevenue",
+                    CURRENCY
                 )
                 d["mtd_rev_global"] = float(mtd_to_global)  # 0.0 is valid (shows $0)
                 print(f"  {label}: MTD to {global_latest} = {fmt_or_dash_money(mtd_to_global)}")
