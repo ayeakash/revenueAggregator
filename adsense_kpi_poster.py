@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-YouTube AdSense KPI Poster — Revenue ONLY (No Sheets, Global Projection, Improved Latest-Date Detection)
+YouTube AdSense KPI Poster — Revenue ONLY (No Sheets, Global Projection, Debug Tail)
 
 - Pulls per-channel revenue from YouTube Analytics.
 - Computes per-channel AND total projections using a single global finalized date.
 - Posts one Slack message with totals and per-channel lines.
 - Auto-hydrates YT_CLIENT_ID/SECRET from YT_OAUTH_CLIENT_JSON or YT_OAUTH_CLIENT.
 
-Required env:
+Env (required):
   - SLACK_WEBHOOK_URL
   - YT_TOKENS_FILE  (e.g., yt_refresh_tokens.json)
   AND EITHER:
@@ -17,6 +17,8 @@ Required env:
 
 Optional:
   - YT_CURRENCY (USD|INR; default USD)
+  - YT_LATEST_PAD_DAYS (default 2)  -> pad end of window when detecting latest day
+  - YT_DEBUG_TAIL=true|false (default false) -> print last 7 API rows per channel
 """
 
 import os, json, sys, re, pathlib, traceback
@@ -31,6 +33,9 @@ TOKENS_FILE   = os.getenv("YT_TOKENS_FILE",   "yt_refresh_tokens.json")
 
 CURRENCY           = os.getenv("YT_CURRENCY", "USD")
 SLACK_WEBHOOK_URL  = os.getenv("SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/XXXXX/XXXXX/XXXXXXXX")
+
+LATEST_PAD_DAYS    = int(os.getenv("YT_LATEST_PAD_DAYS", "2"))
+DEBUG_TAIL         = os.getenv("YT_DEBUG_TAIL", "false").lower() == "true"
 
 # -------------------- CONSTANTS --------------------
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -48,6 +53,8 @@ def info_banner():
     print("Python:", sys.version)
     print("requests:", requests.__version__)
     print("Currency:", CURRENCY)
+    print("Latest pad days:", LATEST_PAD_DAYS)
+    print("Debug tail:", DEBUG_TAIL)
     print()
 
 # -------------------- UTILS --------------------
@@ -179,18 +186,23 @@ def yt_query(access_token, start_date, end_date, dims="day", metrics="estimatedR
         raise
     return r.json()
 
-# >>> Improved latest-day detection (asks through TODAY and picks max date returned)
+# Latest-day detection with padding to cover PT finalization lag
 def detect_latest_day(access_token, metric: str) -> date:
-    end = date.today()                 # allow API to include newest finalized day
-    start = end - timedelta(days=30)   # wider window helps during lag
+    """
+    Ask YT Analytics for a wide window ending 'today + pad' and pick the latest date
+    the API actually returns. Padding helps across time zones (IST vs PT).
+    """
+    pad_days = max(0, LATEST_PAD_DAYS)
+    end = date.today() + timedelta(days=pad_days)
+    start = end - timedelta(days=45)  # wide enough for month edges + lag
     try:
         data = yt_query(access_token, start.isoformat(), end.isoformat(),
                         dims="day", metrics=metric)
     except requests.HTTPError:
-        # try an even wider fallback if needed
-        start = end - timedelta(days=60)
-        data = yt_query(access_token, start.isoformat(), end.isoformat(),
-                        dims="day", metrics=metric)
+        # last-resort wider fallback
+        start = end - timedelta(days=75)
+        data  = yt_query(access_token, start.isoformat(), end.isoformat(),
+                         dims="day", metrics=metric)
     rows = data.get("rows") or []
     if not rows:
         return None
@@ -201,6 +213,33 @@ def detect_latest_day(access_token, metric: str) -> date:
 def sum_metric(access_token, start, end, metric, currency=CURRENCY) -> float:
     data = yt_query(access_token, start, end, dims="day", metrics=metric, currency=currency)
     return float(sum(r[1] for r in (data.get("rows") or [])))
+
+# --------- DEBUG HELPERS: print last 7 API rows per channel (toggle via YT_DEBUG_TAIL) ----------
+def last_n_days_debug(access_token, metric="estimatedRevenue", days=14):
+    """Return the last N day-rows (as list of (date_str, value)) that the API actually returns."""
+    e = date.today() + timedelta(days=max(0, LATEST_PAD_DAYS))
+    s = e - timedelta(days=60)
+    data = yt_query(access_token, s.isoformat(), e.isoformat(), dims="day", metrics=metric)
+    rows = data.get("rows") or []
+    rows.sort(key=lambda r: r[0])  # chronological
+    return rows[-days:]
+
+def print_api_tail_for_revenue(per_chan, labels_order):
+    print("\n[DEBUG] API tail for estimatedRevenue (last ~7 rows)")
+    for label in labels_order:
+        at = per_chan.get(label, {}).get("access_token")
+        if not at:
+            print(f"  - {label}: (no access token)")
+            continue
+        try:
+            tail = last_n_days_debug(at, "estimatedRevenue", days=7)
+            if not tail:
+                print(f"  - {label}: (no rows)")
+                continue
+            pretty = ", ".join([f"{d}:{v:.0f}" for d, v in tail])
+            print(f"  - {label}: {pretty}")
+        except Exception as e:
+            print(f"  - {label}: error fetching tail: {e}")
 
 # -------------------- SLACK FORMAT & POSTING --------------------
 def fmt_money(x):
@@ -367,6 +406,10 @@ def main():
             "reason": None,
         }
         print()
+
+    # --------- Optional debug: show last 7 API rows per channel ----------
+    if DEBUG_TAIL:
+        print_api_tail_for_revenue(per_chan, labels_order)
 
     # ---------- Determine global_latest (across channels that had any finalized day) ----------
     latest_candidates = [d["rev_latest"] for d in per_chan.values() if d.get("rev_latest")]
