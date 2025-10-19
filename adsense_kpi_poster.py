@@ -1,36 +1,27 @@
 #!/usr/bin/env python3
 """
-YouTube AdSense KPI Poster — Revenue ONLY (Colab & CI Ready)
+YouTube AdSense KPI Poster — Revenue ONLY (No Sheets, Global Projection, Improved Latest-Date Detection)
 
 - Pulls per-channel revenue from YouTube Analytics.
-- Posts one Slack message (Revenue) with totals and per-channel lines.
-- Optional Google Sheets append/overwrite.
+- Computes per-channel AND total projections using a single global finalized date.
+- Posts one Slack message with totals and per-channel lines.
 - Auto-hydrates YT_CLIENT_ID/SECRET from YT_OAUTH_CLIENT_JSON or YT_OAUTH_CLIENT.
 
-Env you can set (Colab or CI):
-  Required (one of):
-    - YT_CLIENT_ID + YT_CLIENT_SECRET
-    - YT_OAUTH_CLIENT_JSON (path) or YT_OAUTH_CLIENT (json blob string)
-  Also required:
-    - SLACK_WEBHOOK_URL
-    - YT_TOKENS_FILE  (e.g., yt_refresh_tokens.json)
+Required env:
+  - SLACK_WEBHOOK_URL
+  - YT_TOKENS_FILE  (e.g., yt_refresh_tokens.json)
+  AND EITHER:
+  - YT_CLIENT_ID + YT_CLIENT_SECRET
+  OR
+  - YT_OAUTH_CLIENT_JSON (path) / YT_OAUTH_CLIENT (json blob string)
 
-Optional (Sheets):
-  - GOOGLE_SHEET_URL (empty to skip)
-  - SHEETS_AUTH_MODE=service_account|oauth (default: service_account)
-  - SERVICE_ACCOUNT_JSON (file path)
-  - SHEET_TAB (default: facts_revenue)
-  - APPEND_TO_SHEET=true|false
+Optional:
+  - YT_CURRENCY (USD|INR; default USD)
 """
 
 import os, json, sys, re, pathlib, traceback
 import requests
-import pandas as pd
 from datetime import date, timedelta
-
-# Optional Sheets
-import gspread
-from gspread_dataframe import set_with_dataframe
 
 # -------------------- CONFIG --------------------
 CLIENT_ID     = os.getenv("YT_CLIENT_ID",     "YOUR_WEB_CLIENT_ID.apps.googleusercontent.com")
@@ -40,15 +31,6 @@ TOKENS_FILE   = os.getenv("YT_TOKENS_FILE",   "yt_refresh_tokens.json")
 
 CURRENCY           = os.getenv("YT_CURRENCY", "USD")
 SLACK_WEBHOOK_URL  = os.getenv("SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/XXXXX/XXXXX/XXXXXXXX")
-
-GOOGLE_SHEET_URL   = os.getenv("GOOGLE_SHEET_URL", "")
-SHEET_TAB          = os.getenv("SHEET_TAB", "facts_revenue")
-APPEND_TO_SHEET    = os.getenv("APPEND_TO_SHEET", "true").lower() == "true"
-
-SHEETS_AUTH_MODE   = os.getenv("SHEETS_AUTH_MODE", "service_account").strip()
-SERVICE_ACCOUNT_JSON   = os.getenv("SERVICE_ACCOUNT_JSON", "service_account.json")
-GSPREAD_CLIENT_SECRET  = os.getenv("GSPREAD_CLIENT_SECRET", "client_secret_XXXX.json")
-GSPREAD_AUTHORIZED_USER = os.getenv("GSPREAD_AUTHORIZED_USER", "gspread_authorized_user.json")
 
 # -------------------- CONSTANTS --------------------
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -61,12 +43,10 @@ SPACER_BLOCK = {"type": "section", "text": {"type": "mrkdwn", "text": "\u200b"}}
 # -------------------- STARTUP INFO --------------------
 def info_banner():
     print("="*60)
-    print("YouTube AdSense KPI Poster — Revenue ONLY")
+    print("YouTube AdSense KPI Poster — Revenue ONLY (No Sheets, Global Projection)")
     print("="*60)
     print("Python:", sys.version)
     print("requests:", requests.__version__)
-    print("pandas:", pd.__version__)
-    print("Sheets mode:", SHEETS_AUTH_MODE)
     print("Currency:", CURRENCY)
     print()
 
@@ -87,6 +67,7 @@ def load_tokens_file(path: str) -> dict:
     if not p.exists():
         raise FileNotFoundError(f"Tokens file not found: {path}")
     raw = p.read_text(encoding="utf-8")
+    # allow //, # comments and trailing commas
     raw = re.sub(r"/\*.*?\*/", "", raw, flags=re.S)
     raw = re.sub(r"^\s*//.*?$", "", raw, flags=re.M)
     raw = re.sub(r"^\s*#.*?$",  "", raw, flags=re.M)
@@ -101,6 +82,10 @@ def require_env(name, placeholder_fragments=()):
     if not val or any(frag in val for frag in placeholder_fragments):
         raise RuntimeError(f"Missing or placeholder env: {name}")
     return val
+
+def fmt_day(d):
+    # Example: 16-Oct-2025
+    return d.strftime("%d-%b-%Y") if d else ""
 
 # -------------------- OPTIONAL: AUTO-HYDRATE OAUTH CLIENT --------------------
 def hydrate_oauth_client_from_json():
@@ -194,17 +179,21 @@ def yt_query(access_token, start_date, end_date, dims="day", metrics="estimatedR
         raise
     return r.json()
 
+# >>> Improved latest-day detection (asks through TODAY and picks max date returned)
 def detect_latest_day(access_token, metric: str) -> date:
-    end = date.today() - timedelta(days=1)
-    start = end - timedelta(days=14)
-    data = yt_query(access_token, start.isoformat(), end.isoformat(), dims="day", metrics=metric)
+    end = date.today()                 # allow API to include newest finalized day
+    start = end - timedelta(days=30)   # wider window helps during lag
+    try:
+        data = yt_query(access_token, start.isoformat(), end.isoformat(),
+                        dims="day", metrics=metric)
+    except requests.HTTPError:
+        # try an even wider fallback if needed
+        start = end - timedelta(days=60)
+        data = yt_query(access_token, start.isoformat(), end.isoformat(),
+                        dims="day", metrics=metric)
     rows = data.get("rows") or []
     if not rows:
-        start = end - timedelta(days=30)
-        data = yt_query(access_token, start.isoformat(), end.isoformat(), dims="day", metrics=metric)
-        rows = data.get("rows") or []
-        if not rows:
-            return None
+        return None
     latest_str = max(r[0] for r in rows)
     y, m, d = map(int, latest_str.split("-"))
     return date(y, m, d)
@@ -212,94 +201,6 @@ def detect_latest_day(access_token, metric: str) -> date:
 def sum_metric(access_token, start, end, metric, currency=CURRENCY) -> float:
     data = yt_query(access_token, start, end, dims="day", metrics=metric, currency=currency)
     return float(sum(r[1] for r in (data.get("rows") or [])))
-
-# -------------------- SHEETS (OPTIONAL) --------------------
-def get_gspread_client():
-    if not GOOGLE_SHEET_URL:
-        return None
-    mode = SHEETS_AUTH_MODE.lower().strip()
-    if mode == "service_account":
-        if not os.path.exists(SERVICE_ACCOUNT_JSON):
-            raise FileNotFoundError(f"[Sheets] SERVICE_ACCOUNT_JSON not found: {SERVICE_ACCOUNT_JSON}")
-        return gspread.service_account(filename=SERVICE_ACCOUNT_JSON)
-    if mode == "oauth":
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
-                  "https://www.googleapis.com/auth/drive"]
-        if not os.path.exists(GSPREAD_CLIENT_SECRET):
-            raise FileNotFoundError(
-                f"[Sheets] GSPREAD_CLIENT_SECRET not found: {GSPREAD_CLIENT_SECRET}\n"
-                "Use a Desktop (installed) client JSON (top-level key 'installed')."
-            )
-        flow = InstalledAppFlow.from_client_secrets_file(GSPREAD_CLIENT_SECRET, SCOPES)
-        creds = flow.run_console()
-        with open(GSPREAD_AUTHORIZED_USER, "w", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "client_id": creds.client_id,
-                "client_secret": creds.client_secret,
-                "refresh_token": creds.refresh_token,
-                "token": creds.token,
-                "scopes": creds.scopes,
-                "type": "authorized_user"
-            }))
-        return gspread.authorize(creds)
-    raise ValueError(f"[Sheets] Unknown SHEETS_AUTH_MODE: {SHEETS_AUTH_MODE}")
-
-def write_facts_to_sheets(per_chan, currency, sheet_url, sheet_tab):
-    if not sheet_url:
-        print("[Sheets] Skipped (GOOGLE_SHEET_URL empty)")
-        return
-
-    gc = get_gspread_client()
-    sh = gc.open_by_url(sheet_url)
-    try:
-        ws = sh.worksheet(sheet_tab)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=sheet_tab, rows="1000", cols="20")
-
-    facts = []
-    for label, d in per_chan.items():
-        latest_any = d.get("rev_latest")
-        if latest_any is None:
-            continue
-        facts.append({
-            "as_of_day": d["rev_latest"].isoformat(),
-            "channel": label,
-            "y_rev": d.get("y_rev"),
-            "mtd_rev": d.get("mtd_rev"),
-            "last_month_rev": d.get("last_month_rev"),
-            "currency": currency,
-        })
-
-    df = pd.DataFrame(facts)
-    if df.empty:
-        print("[Sheets] No rows to write (df empty).")
-        return
-
-    cols = ["as_of_day", "channel", "y_rev", "mtd_rev", "last_month_rev", "currency"]
-    for c in ["y_rev","mtd_rev","last_month_rev"]:
-        if c in df.columns:
-            df[c] = df[c].map(lambda v: round(v,2) if isinstance(v,(int,float)) else None)
-    for c in cols:
-        if c not in df.columns:
-            df[c] = None
-    df = df[cols]
-
-    if APPEND_TO_SHEET:
-        values = ws.get_all_values()
-        if not values:
-            ws.append_row(cols)
-            print("[Sheets] Header created.")
-        header = values[0] if values else cols
-        if header != cols:
-            ws.clear()
-            ws.append_row(cols)
-            print("[Sheets] Header reset.")
-        ws.append_rows(df.values.tolist(), value_input_option="USER_ENTERED")
-        print(f"[Sheets] Appended {len(df)} row(s) to '{sheet_tab}'.")
-    else:
-        set_with_dataframe(ws, df)
-        print(f"[Sheets] Overwrote '{sheet_tab}' with {len(df)} row(s).")
 
 # -------------------- SLACK FORMAT & POSTING --------------------
 def fmt_money(x):
@@ -311,6 +212,7 @@ def fmt_or_dash_money(x):
 def month_projection_for(latest_day: date, mtd_total: float) -> float:
     if not latest_day or not isinstance(mtd_total, (int, float)):
         return 0.0
+    # exact month length (31/30/28/29)
     next_month_first = (latest_day.replace(day=28) + timedelta(days=4)).replace(day=1)
     days_in_month = (next_month_first - latest_day.replace(day=1)).days
     elapsed = latest_day.day
@@ -324,62 +226,55 @@ def pct_change(curr: float, base: float):
     sign = "+" if delta >= 0 else ""
     return f" ({sign}{delta:.0f}%)"
 
-def build_revenue_sections(labels, per_chan):
+def build_revenue_sections(labels, per_chan, global_latest):
     y_lines = []
     proj_lines = []
     tot_y = 0.0
-    tot_mtd = 0.0
+    tot_mtd_global = 0.0
     tot_last = 0.0
-    latest_candidates = []
-    y_date_candidates = []  # track date used for “yesterday”
 
     for label in labels:
         d = per_chan.get(label, {})
+        # ---------- Yesterday ----------
         latest = d.get("rev_latest")
-        y_val = d.get("y_rev")
-        mtd_val = d.get("mtd_rev")
-        last_val = d.get("last_month_rev")
-
-        # Yesterday
+        y_val  = d.get("y_rev")
         if latest is None or y_val is None:
             y_lines.append(f"• {label}: {EM_DASH}")
         else:
             y_lines.append(f"• {label}: {fmt_money(y_val)}")
             tot_y += y_val
-            y_date_candidates.append(latest)
 
-        # Projection
-        if latest is None or mtd_val is None:
+        # ---------- Projection (global) ----------
+        ch_mtd_glob = d.get("mtd_rev_global", None)
+        ch_last     = d.get("last_month_rev", None)
+
+        if global_latest is None:
+            proj_lines.append(f"• {label}: {EM_DASH}")
+        elif ch_mtd_glob is None:
             proj_lines.append(f"• {label}: {EM_DASH}")
         else:
-            ch_proj = month_projection_for(latest, mtd_val)
-            proj_lines.append(f"• {label}: {fmt_money(ch_proj)}{pct_change(ch_proj, last_val)}")
-            tot_mtd += mtd_val
-            if isinstance(last_val, (int, float)):
-                tot_last += last_val
-            latest_candidates.append(latest)
+            ch_proj = month_projection_for(global_latest, ch_mtd_glob)
+            proj_lines.append(f"• {label}: {fmt_money(ch_proj)}{pct_change(ch_proj, ch_last)}")
+            tot_mtd_global += ch_mtd_glob
+            if isinstance(ch_last, (int, float)):
+                tot_last += ch_last
 
-    # Totals & dates
-    has_any = bool(latest_candidates)
-    global_latest = max(latest_candidates) if has_any else None
-    tot_proj = month_projection_for(global_latest, tot_mtd) if has_any else None
-    if not has_any:
+    # Totals & header date
+    tot_proj = month_projection_for(global_latest, tot_mtd_global) if global_latest else None
+    if global_latest is None:
         tot_y = None
-        tot_mtd = None
         tot_last = None
-    y_date = max(y_date_candidates).isoformat() if y_date_candidates else EM_DASH
 
-    header_y = f":spiral_calendar_pad: *Yesterday:* {fmt_or_dash_money(tot_y)}"
-    # Changed: “Projection” -> “[P]”
-    header_proj = f":calendar: *This Month [P]:* {fmt_or_dash_money(tot_proj)}" + \
-                  (pct_change(tot_proj or 0.0, tot_last or 0.0) if (tot_proj is not None and tot_last) else "")
+    header_title = f"*AdSense KPI* ({fmt_day(global_latest)})" if global_latest else "*AdSense KPI*"
+    header_y     = f":spiral_calendar_pad: *Yesterday:* {fmt_or_dash_money(tot_y)}"
+    header_proj  = f":calendar: *This Month Projection:* {fmt_or_dash_money(tot_proj)}" + \
+                   (pct_change(tot_proj or 0.0, tot_last or 0.0) if (tot_proj is not None and tot_last) else "")
 
     blocks = [
-        {"type":"section","text":{"type":"mrkdwn","text":"*AdSense KPI (Revenue)*"}},
+        {"type":"section","text":{"type":"mrkdwn","text":header_title}},
         {"type":"divider"},
         {"type":"section","text":{"type":"mrkdwn","text":header_y}},
         SPACER_BLOCK,
-        {"type":"context","elements":[{"type":"mrkdwn","text":f"_Yesterday date:_ *{y_date}*"}]},
         {"type":"section","text":{"type":"mrkdwn","text":"\n\n".join(y_lines) if y_lines else EM_DASH}},
         {"type":"divider"},
         {"type":"section","text":{"type":"mrkdwn","text":header_proj}},
@@ -403,19 +298,9 @@ def post_to_slack(payload, label="payload"):
         print("[Slack] Payload preview (truncated):", (json.dumps(payload)[:1200] + "…"))
         return False
 
-def slack_self_test():
-    if not SLACK_WEBHOOK_URL or "hooks.slack.com/services/" not in SLACK_WEBHOOK_URL:
-        print("[Slack] Webhook missing or placeholder. Set SLACK_WEBHOOK_URL."); return
-    try:
-        r = requests.post(SLACK_WEBHOOK_URL, json={"text": "✅ Slack webhook test: Hello from YouTube Revenue bot."}, timeout=10)
-        print("Slack test status:", r.status_code, r.text[:200] or "(empty)")
-    except Exception as e:
-        print("Slack test failed:", e)
-
 # -------------------- MAIN --------------------
 def main():
     info_banner()
-
     hydrate_oauth_client_from_json()
 
     require_env("YT_CLIENT_ID", ("YOUR_WEB_CLIENT_ID",))
@@ -427,6 +312,7 @@ def main():
 
     per_chan = {}
 
+    # ---------- First pass: identify channels, latest day, Y/MTD/Last (per-channel latest) ----------
     for label, obj in tokens.items():
         print(f"— Channel label: {label}")
         rf = obj.get("refresh_token")
@@ -449,7 +335,6 @@ def main():
             ch_id, ch_title = None, None
             print("  ! channel_identity failed; continuing…")
 
-        # Revenue
         rev_latest = None
         y_rev = mtd_rev = last_rev = None
         try:
@@ -468,39 +353,83 @@ def main():
         except requests.HTTPError as e:
             status = getattr(e.response, "status_code", None)
             if status == 403:
-                print("  ! Revenue 403 (likely not monetized or no revenue data).")
+                print("  ! Revenue 403 (likely not monetized / no Analytics access).")
             else:
                 print("  ! Revenue query failed:", e)
 
+        # store access token for second pass
         per_chan[label] = {
+            "access_token": at,
             "channel_id": ch_id, "channel_title": ch_title,
             "rev_latest": rev_latest,
             "y_rev": y_rev, "mtd_rev": mtd_rev, "last_month_rev": last_rev,
+            "mtd_rev_global": None,
+            "reason": None,
         }
         print()
 
-    # Sheets (optional)
-    try:
-        if GOOGLE_SHEET_URL:
-            write_facts_to_sheets(per_chan, CURRENCY, GOOGLE_SHEET_URL, SHEET_TAB)
-        else:
-            print("[Sheets] Skipped (GOOGLE_SHEET_URL empty)")
-    except Exception as e:
-        print("[Sheets] Skipping Sheets due to error:", e)
+    # ---------- Determine global_latest (across channels that had any finalized day) ----------
+    latest_candidates = [d["rev_latest"] for d in per_chan.values() if d.get("rev_latest")]
+    global_latest = max(latest_candidates) if latest_candidates else None
+    print("Global latest finalized day:", global_latest if global_latest else "(none)")
 
-    # Slack
-    slack_self_test()
-    blocks = build_revenue_sections(labels_order, per_chan)
+    # ---------- Second pass: recompute MTD up to global_latest for every channel ----------
+    if global_latest:
+        month_first_global = global_latest.replace(day=1)
+        for label in labels_order:
+            d = per_chan.setdefault(label, {})
+            d.setdefault("reason", None)
+
+            at = d.get("access_token")
+            if not at:
+                rf = tokens[label].get("refresh_token")
+                if rf:
+                    try:
+                        at = get_access_token(rf)
+                        d["access_token"] = at
+                    except Exception:
+                        at = None
+                        d["reason"] = d.get("reason") or "no_access_token"
+
+            if not at:
+                print(f"  ! {label}: cannot recompute MTD to global (no access token).")
+                d["mtd_rev_global"] = None
+                d["reason"] = d.get("reason") or "no_access_token"
+                continue
+
+            try:
+                mtd_to_global = sum_metric(
+                    at,
+                    month_first_global.isoformat(),
+                    global_latest.isoformat(),
+                    "estimatedRevenue"
+                )
+                d["mtd_rev_global"] = float(mtd_to_global)  # 0.0 is valid (shows $0)
+                print(f"  {label}: MTD to {global_latest} = {fmt_or_dash_money(mtd_to_global)}")
+            except requests.HTTPError as e:
+                status = getattr(e.response, "status_code", None)
+                if status == 403:
+                    print(f"  ! {label}: 403 when recomputing MTD to global (not monetized / no Analytics access).")
+                    d["mtd_rev_global"] = None
+                    d["reason"] = "403_forbidden"
+                else:
+                    print(f"  ! {label}: error recomputing MTD to global:", e)
+                    d["mtd_rev_global"] = None
+                    d["reason"] = "error"
+
+    # ---------- Slack ----------
+    blocks = build_revenue_sections(labels_order, per_chan, global_latest)
     post_to_slack({"blocks": blocks}, label="Revenue")
 
-    # Console compact summary
+    # ---------- Console compact summary ----------
     print("\nSummary (compact)")
     for label in labels_order:
         d = per_chan.get(label, {})
         rY = fmt_or_dash_money(d.get("y_rev")) if d.get("rev_latest") else EM_DASH
         rM = fmt_or_dash_money(d.get("mtd_rev")) if d.get("rev_latest") else EM_DASH
+        rG = fmt_or_dash_money(d.get("mtd_rev_global")) if global_latest and d.get("mtd_rev_global") is not None else EM_DASH
         rL = fmt_or_dash_money(d.get("last_month_rev")) if d.get("rev_latest") else EM_DASH
-        print(f"{label}: Rev(Y/MTD/LM)={rY}/{rM}/{rL}")
+        print(f"{label}: Rev(Y/MTD(ch)/MTD(global)/LM)={rY}/{rM}/{rG}/{rL}")
 
 if __name__ == "__main__":
     try:
