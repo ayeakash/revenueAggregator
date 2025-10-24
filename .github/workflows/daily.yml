@@ -1,19 +1,19 @@
-name: Daily YouTube KPI (robust)
+name: Hourly YouTube KPI (robust)
 
 on:
   schedule:
-    - cron: "0 2 * * *"   # 02:00 UTC ≈ 07:30 IST
+    - cron: "0 * * * *"   # Every hour at minute 0 (UTC)
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 jobs:
-  run-daily:
+  run-hourly:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     concurrency:
-      group: daily-youtube-kpi
+      group: hourly-youtube-kpi
       cancel-in-progress: true
 
     steps:
