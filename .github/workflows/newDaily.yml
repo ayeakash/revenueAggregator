@@ -3,7 +3,7 @@ name: YouTube KPIs → Slack (Revenue & Views)
 on:
   schedule:
     # 07:30 IST daily = 02:00 UTC
-    - cron: '0 2 * * *'
+    - cron: '0 1 * * *'
   workflow_dispatch: {}
 
 permissions:
